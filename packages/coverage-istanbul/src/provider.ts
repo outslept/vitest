@@ -12,8 +12,9 @@ import libReport from 'istanbul-lib-report'
 import libSourceMaps from 'istanbul-lib-source-maps'
 import reports from 'istanbul-reports'
 import { parseModule } from 'magicast'
+import mm from 'micromatch'
 import { resolve } from 'pathe'
-import TestExclude from 'test-exclude'
+import { glob } from 'tinyglobby'
 import c from 'tinyrainbow'
 import { BaseCoverageProvider } from 'vitest/coverage'
 
@@ -26,19 +27,25 @@ export class IstanbulCoverageProvider extends BaseCoverageProvider<ResolvedCover
   name = 'istanbul' as const
   version: string = version
   instrumenter!: Instrumenter
-  testExclude!: InstanceType<typeof TestExclude>
+
+  include!: string[]
+  exclude!: string[]
+  extension!: string[]
+  excludeNodeModules!: boolean
+  relativePath!: boolean
 
   initialize(ctx: Vitest): void {
     this._initialize(ctx)
 
-    this.testExclude = new TestExclude({
-      cwd: ctx.config.root,
-      include: this.options.include,
-      exclude: this.options.exclude,
-      excludeNodeModules: true,
-      extension: this.options.extension,
-      relativePath: !this.options.allowExternal,
-    })
+    this.include = this.options.include || []
+    this.exclude = this.options.exclude || []
+    this.extension = Array.isArray(this.options.extension)
+      ? this.options.extension
+      : this.options.extension
+        ? [this.options.extension]
+        : []
+    this.excludeNodeModules = true
+    this.relativePath = !this.options.allowExternal
 
     this.instrumenter = createInstrumenter({
       produceSourceMap: true,
@@ -60,8 +67,62 @@ export class IstanbulCoverageProvider extends BaseCoverageProvider<ResolvedCover
     })
   }
 
+  shouldInstrument(filename: string): boolean {
+    const relPath = this.relativePath
+      ? filename.replace(`${this.ctx.config.root}/`, '')
+      : filename
+
+    if (
+      this.extension
+      && this.extension.length > 0
+      && !this.extension.some(ext => relPath.endsWith(ext))
+    ) {
+      return false
+    }
+
+    if (this.excludeNodeModules !== false && relPath.includes('node_modules')) {
+      return false
+    }
+
+    if (this.exclude && this.exclude.length > 0 && mm.isMatch(relPath, this.exclude)) {
+      return false
+    }
+
+    if (this.include && this.include.length > 0 && !mm.isMatch(relPath, this.include)) {
+      return false
+    }
+
+    return true
+  }
+
+  async globFiles(root: string): Promise<string[]> {
+    const patterns = this.include && this.include.length > 0 ? this.include : ['**/*']
+
+    const ignore: string[] = []
+    if (this.exclude && this.exclude.length > 0) {
+      ignore.push(...this.exclude)
+    }
+
+    if (this.excludeNodeModules !== false) {
+      ignore.push('**/node_modules/**')
+    }
+
+    let files = await glob(patterns, {
+      cwd: root,
+      ignore,
+      absolute: !this.relativePath,
+      onlyFiles: true,
+    })
+
+    if (this.extension && this.extension.length > 0) {
+      files = files.filter(file => this.extension.some(ext => file.endsWith(ext)))
+    }
+
+    return files
+  }
+
   onFileTransform(sourceCode: string, id: string, pluginCtx: any): { code: string; map: any } | undefined {
-    if (!this.testExclude.shouldInstrument(id)) {
+    if (!this.shouldInstrument(id)) {
       return
     }
 
@@ -119,11 +180,11 @@ export class IstanbulCoverageProvider extends BaseCoverageProvider<ResolvedCover
     }
 
     if (this.options.excludeAfterRemap) {
-      coverageMap.filter(filename => this.testExclude.shouldInstrument(filename))
+      coverageMap.filter(filename => this.shouldInstrument(filename))
     }
 
     if (debug.enabled) {
-      debug('Generate coverage total time %d ms', (performance.now() - start!).toFixed())
+      debug('Generate coverage total time %d ms', (performance.now() - start).toFixed())
     }
 
     return coverageMap
@@ -165,7 +226,7 @@ export class IstanbulCoverageProvider extends BaseCoverageProvider<ResolvedCover
   }
 
   private async getCoverageMapForUncoveredFiles(coveredFiles: string[]) {
-    const allFiles = await this.testExclude.glob(this.ctx.config.root)
+    const allFiles = await this.globFiles(this.ctx.config.root)
     let includedFiles = allFiles.map(file =>
       resolve(this.ctx.config.root, file),
     )

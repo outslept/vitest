@@ -16,9 +16,10 @@ import libSourceMaps from 'istanbul-lib-source-maps'
 import reports from 'istanbul-reports'
 import MagicString from 'magic-string'
 import { parseModule } from 'magicast'
+import mm from 'micromatch'
 import { normalize, resolve } from 'pathe'
 import { provider } from 'std-env'
-import TestExclude from 'test-exclude'
+import { glob } from 'tinyglobby'
 import c from 'tinyrainbow'
 import v8ToIstanbul from 'v8-to-istanbul'
 import { cleanUrl } from 'vite-node/utils'
@@ -33,7 +34,6 @@ export interface ScriptCoverageWithOffset extends Profiler.ScriptCoverage {
 type TransformResults = Map<string, FetchResult>
 interface RawCoverage { result: ScriptCoverageWithOffset[] }
 
-// Note that this needs to match the line ending as well
 const VITE_EXPORTS_LINE_PATTERN
   = /Object\.defineProperty\(__vite_ssr_exports__.*\n/g
 const DECORATOR_METADATA_PATTERN
@@ -45,19 +45,79 @@ const debug = createDebug('vitest:coverage')
 export class V8CoverageProvider extends BaseCoverageProvider<ResolvedCoverageOptions<'v8'>> implements CoverageProvider {
   name = 'v8' as const
   version: string = version
-  testExclude!: InstanceType<typeof TestExclude>
+
+  include!: string[]
+  exclude!: string[]
+  extension!: string[]
+  excludeNodeModules!: boolean
+  relativePath!: boolean
 
   initialize(ctx: Vitest): void {
     this._initialize(ctx)
 
-    this.testExclude = new TestExclude({
-      cwd: ctx.config.root,
-      include: this.options.include,
-      exclude: this.options.exclude,
-      excludeNodeModules: true,
-      extension: this.options.extension,
-      relativePath: !this.options.allowExternal,
+    this.include = this.options.include || []
+    this.exclude = this.options.exclude || []
+    this.extension = Array.isArray(this.options.extension)
+      ? this.options.extension
+      : this.options.extension
+        ? [this.options.extension]
+        : []
+    this.excludeNodeModules = true
+    this.relativePath = !this.options.allowExternal
+  }
+
+  shouldInstrument(filename: string): boolean {
+    const relPath = this.relativePath
+      ? filename.replace(`${this.ctx.config.root}/`, '')
+      : filename
+
+    if (
+      this.extension
+      && this.extension.length > 0
+      && !this.extension.some(ext => relPath.endsWith(ext))
+    ) {
+      return false
+    }
+
+    if (this.excludeNodeModules !== false && relPath.includes('node_modules')) {
+      return false
+    }
+
+    if (this.exclude && this.exclude.length > 0 && mm.isMatch(relPath, this.exclude)) {
+      return false
+    }
+
+    if (this.include && this.include.length > 0 && !mm.isMatch(relPath, this.include)) {
+      return false
+    }
+
+    return true
+  }
+
+  async globFiles(root: string): Promise<string[]> {
+    const patterns = this.include && this.include.length > 0 ? this.include : ['**/*']
+
+    const ignore: string[] = []
+    if (this.exclude && this.exclude.length > 0) {
+      ignore.push(...this.exclude)
+    }
+
+    if (this.excludeNodeModules !== false) {
+      ignore.push('**/node_modules/**')
+    }
+
+    let files = await glob(patterns, {
+      cwd: root,
+      ignore,
+      absolute: !this.relativePath,
+      onlyFiles: true,
     })
+
+    if (this.extension && this.extension.length > 0) {
+      files = files.filter(file => this.extension.some(ext => file.endsWith(ext)))
+    }
+
+    return files
   }
 
   createCoverageMap(): CoverageMap {
@@ -109,11 +169,11 @@ export class V8CoverageProvider extends BaseCoverageProvider<ResolvedCoverageOpt
     }
 
     if (this.options.excludeAfterRemap) {
-      coverageMap.filter(filename => this.testExclude.shouldInstrument(filename))
+      coverageMap.filter(filename => this.shouldInstrument(filename))
     }
 
     if (debug.enabled) {
-      debug(`Generate coverage total time ${(performance.now() - start!).toFixed()} ms`)
+      debug(`Generate coverage total time ${(performance.now() - start).toFixed()} ms`)
     }
 
     return coverageMap
@@ -169,7 +229,7 @@ export class V8CoverageProvider extends BaseCoverageProvider<ResolvedCoverageOpt
     )
     const transform = this.createUncoveredFileTransformer(this.ctx)
 
-    const allFiles = await this.testExclude.glob(this.ctx.config.root)
+    const allFiles = await this.globFiles(this.ctx.config.root)
     let includedFiles = allFiles.map(file =>
       resolve(this.ctx.config.root, file),
     )
@@ -230,7 +290,6 @@ export class V8CoverageProvider extends BaseCoverageProvider<ResolvedCoverageOpt
               },
             ],
             isBlockCoverage: true,
-            // This is magical value that indicates an empty report: https://github.com/istanbuljs/v8-to-istanbul/blob/fca5e6a9e6ef38a9cdc3a178d5a6cf9ef82e6cab/lib/v8-to-istanbul.js#LL131C40-L131C40
             functionName: '(empty-report)',
           }])
         }
@@ -277,14 +336,11 @@ export class V8CoverageProvider extends BaseCoverageProvider<ResolvedCoverageOpt
 
     if (!sourcesContent[0]) {
       sourcesContent[0] = await fs.readFile(filePath, 'utf-8').catch(() => {
-        // If file does not exist construct a dummy source for it.
-        // These can be files that were generated dynamically during the test run and were removed after it.
         const length = findLongestFunctionLength(functions)
         return '.'.repeat(length)
       })
     }
 
-    // These can be uncovered files included by "all: true" or files that are loaded outside vite-node
     if (!map) {
       return {
         source: code || sourcesContent[0],
@@ -330,7 +386,6 @@ export class V8CoverageProvider extends BaseCoverageProvider<ResolvedCoverageOpt
     async function onTransform(filepath: string) {
       if (transformMode === 'browser' && project.browser) {
         const result = await project.browser.vite.transformRequest(removeStartsWith(filepath, project.config.root))
-
         if (result) {
           return { ...result, code: `${result.code}// <inline-source-map>` }
         }
@@ -350,7 +405,7 @@ export class V8CoverageProvider extends BaseCoverageProvider<ResolvedCoverageOpt
         }
       }
 
-      if (this.testExclude.shouldInstrument(fileURLToPath(result.url))) {
+      if (this.shouldInstrument(fileURLToPath(result.url))) {
         scriptCoverages.push(result)
       }
     }
